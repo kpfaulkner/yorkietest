@@ -1,2 +1,2 @@
-# yorkietestd
+# yorkietest
 testing yorkie server
