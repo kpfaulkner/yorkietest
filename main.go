@@ -41,14 +41,16 @@ type YorkieTest struct {
 	projectPublicKey string
 }
 
-func NewYorkieTest(ip string, clientPort string, projectPublicKey string) *YorkieTest {
+func NewYorkieTest(ip string, clientPort string, projectPublicKey string, maxDocs int) *YorkieTest {
 	yt := YorkieTest{}
 	yt.docLock = sync.Mutex{}
 	yt.ctx = context.Background()
 	yt.ip = ip
 	yt.clientPort = clientPort
 	yt.projectPublicKey = projectPublicKey
+	yt.maxDocs = maxDocs
 
+	yt.allDocs = make(map[string]*document.Document)
 	// create clients.
 	return &yt
 }
@@ -128,11 +130,12 @@ func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
 	}
 }
 
-func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string) {
+func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string) error {
 
 	yt.docLock.Lock()
-	err := doc.Update(func(root *json.Object) error {
+	defer yt.docLock.Unlock()
 
+	err := doc.Update(func(root *json.Object) error {
 		// value is empty so remove key.
 		if value == "" {
 			root.Delete(key)
@@ -142,19 +145,20 @@ func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string
 		//fmt.Printf("MARSHAL %v\n", root.Marshal())
 
 		return nil
-	}, "updates k1")
+	}, "updates doc "+doc.Key())
 
 	if err != nil {
 		fmt.Printf("update doc error %v", err)
-		return
+		return err
 	}
 
-	defer yt.docLock.Unlock()
 	err = yt.cli.Sync(yt.ctx, doc.Key())
 	if err != nil {
 		fmt.Printf("sync error %v", err)
-		return
+		return err
 	}
+
+	return nil
 
 }
 
@@ -162,6 +166,14 @@ func (yt *YorkieTest) doBulk(msSleep int) {
 
 	//go yt.watchDoc(doc)
 
+	// create docs.
+	for i := 0; i < yt.maxDocs; i++ {
+		_, err := yt.createAndAttachDoc(fmt.Sprintf("doc%d", i))
+		if err != nil {
+			fmt.Printf("Cannot create doc%d : %s\n", i, err.Error())
+			panic("BOOM")
+		}
+	}
 	yt.bulkUpdate(10000, msSleep)
 }
 
@@ -197,6 +209,7 @@ func (yt *YorkieTest) connectClient() error {
 		return err
 	}
 
+	yt.cli = cli
 	return nil
 }
 
@@ -225,16 +238,16 @@ func (yt *YorkieTest) listDocumentsForProject(projectName string) error {
 	return nil
 }
 
-func (yt *YorkieTest) createAndAttachDoc(docId string) error {
+func (yt *YorkieTest) createAndAttachDoc(docId string) (*document.Document, error) {
 
 	doc := document.New(key.Key(docId))
 	if err := yt.cli.Attach(yt.ctx, doc); err != nil {
 		fmt.Printf("new doc error %v\n", err)
-		return err
+		return nil, err
 	}
 
 	yt.allDocs[docId] = doc
-	return nil
+	return doc, nil
 }
 
 func main() {
@@ -251,19 +264,17 @@ func main() {
 	keyName := flag.String("key", "", "key")
 	value := flag.String("value", "", "value")
 	docName := flag.String("doc", "", "doc key")
-	docRandom := flag.Bool("docrandom", false, "random write docs")
-	maxDocs := flag.Int("maxdocs", 20, "max docs to generate when using docrandom")
+	maxDocs := flag.Int("maxdocs", 20, "max docs to generate when doing bulk updates")
 	readDoc := flag.Bool("read", false, "read doc")
 	listDoc := flag.Bool("list", false, "list docs for project")
 	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
-	clientID := flag.String("id", "", "clientid")
 	clientPort := flag.String("port", "8080", "client connection port")
 
 	flag.Parse()
 
-	yt := NewYorkieTest(*ip, *clientPort, *projectApiKey)
+	yt := NewYorkieTest(*ip, *clientPort, *projectApiKey, *maxDocs)
 
-	yt.adminLogin()
+	//yt.adminLogin()
 	yt.connectClient()
 
 	// create project and bail
@@ -283,44 +294,47 @@ func main() {
 		return
 	}
 
+	var doc *document.Document
+	var err error
 	// if specify doc name... just do the one.
 	if *docName != "" {
-		err := yt.createAndAttachDoc(*docName)
+		doc, err = yt.createAndAttachDoc(*docName)
 		if err != nil {
 			fmt.Printf("createAndAttachDoc err %s\n", err.Error())
 		}
 		return
 	}
 
-	// if random specified and NOT docname
-	if *docRandom && *docName == "" {
-		for i := 0; i < *maxDocs; i++ {
-			dn := fmt.Sprintf("doc%d", i)
-			doc := document.New(key.Key(dn))
-			if err = cli.Attach(ctx, doc); err != nil {
-				fmt.Printf("new doc error %v\n", err)
-				return
+	/*
+		// if random specified and NOT docname
+		if *docRandom && *docName == "" {
+			for i := 0; i < *maxDocs; i++ {
+				dn := fmt.Sprintf("doc%d", i)
+				doc := document.New(key.Key(dn))
+				if err = cli.Attach(ctx, doc); err != nil {
+					fmt.Printf("new doc error %v\n", err)
+					return
+				}
+				allDocs[dn] = doc
 			}
-			allDocs[dn] = doc
-		}
-	}
+		} */
 
 	if *readDoc {
-		watchDoc(*cli, ctx, allDocs)
+		//yt.watchDoc(allDocs)
 		//fmt.Printf(doc.Marshal())
 		return
 	}
 
 	if *doBulkUpdate {
-		doBulk(*cli, ctx, allDocs, *msSleep)
+		yt.doBulk(*msSleep)
 	} else {
-		updateDoc(*cli, ctx, allDocs, *keyName, *value)
+		yt.updateDoc(doc, *keyName, *value)
+		err = yt.cli.Detach(yt.ctx, doc)
+		if err != nil {
+			fmt.Printf("unable to detach : %s\n", err.Error())
+		}
 	}
 
-	err = cli.Detach(ctx, allDocs)
-	if err != nil {
-		fmt.Printf("unable to detach : %s\n", err.Error())
-	}
 }
 
 func merge(cs ...<-chan int) <-chan int {
