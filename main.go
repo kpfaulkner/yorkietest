@@ -55,14 +55,19 @@ func NewYorkieTest(ip string, clientPort string, projectPublicKey string, maxDoc
 	return &yt
 }
 
-/*
 func (yt *YorkieTest) watchDocs() {
 
-	watchCh, err := cli.Watch(ctx, doc)
-	if err != nil {
-		fmt.Printf("watch error %v", err)
-		return
+	var allChannels []<-chan client.WatchResponse
+	for _, doc := range yt.allDocs {
+		watchCh, err := yt.cli.Watch(yt.ctx, doc)
+		if err != nil {
+			fmt.Printf("watch error %v", err)
+			panic("BOOM")
+		}
+		allChannels = append(allChannels, watchCh)
 	}
+
+	docUpdateChannel := mergeChannelWatch(allChannels...)
 
 	count := 0
 	oldCount := 0
@@ -81,18 +86,19 @@ func (yt *YorkieTest) watchDocs() {
 	}()
 
 	fmt.Printf("XXXX waiting for changes\n")
-	for up := range watchCh {
+	for up := range docUpdateChannel {
 
 		//fmt.Printf("update from watch %+v\n", up)
-		m.Lock()
-		err := cli.Sync(ctx, up.Keys...)
+		yt.docLock.Lock()
+		err := yt.cli.Sync(yt.ctx, up.Keys...)
+		fmt.Printf("sync.. type %v :  keys %+v\n", up.Type, up.Keys)
 		//fmt.Printf("after sync %+v\n", up)
 		if err != nil {
 			fmt.Printf("sync error %v", err)
-			m.Unlock()
+			yt.docLock.Unlock()
 			return
 		}
-		m.Unlock()
+		yt.docLock.Unlock()
 		//fmt.Printf("doc is now %+v\n", doc.Marshal())
 		count++
 		if count%100 == 0 {
@@ -104,7 +110,6 @@ func (yt *YorkieTest) watchDocs() {
 
 	fmt.Printf("left watch\n")
 }
-*/
 
 // bulkUpdate sends a bunch of updates to all the documents (randomly)
 func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
@@ -121,7 +126,7 @@ func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
 		// pick a random doc.
 		docName := fmt.Sprintf("doc%d", rand.Intn(yt.maxDocs))
 		doc := yt.allDocs[docName]
-		//fmt.Printf("updating %s to %s\n", key, value)
+		fmt.Printf("updating doc %s : key %s to %s\n", docName, key, value)
 		yt.updateDoc(doc, key, value)
 		if i%100 == 0 {
 			fmt.Printf("update %d\n", i)
@@ -164,8 +169,6 @@ func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string
 
 func (yt *YorkieTest) doBulk(msSleep int) {
 
-	//go yt.watchDoc(doc)
-
 	// create docs.
 	for i := 0; i < yt.maxDocs; i++ {
 		_, err := yt.createAndAttachDoc(fmt.Sprintf("doc%d", i))
@@ -174,6 +177,10 @@ func (yt *YorkieTest) doBulk(msSleep int) {
 			panic("BOOM")
 		}
 	}
+
+	// watch all docs for updates.
+	go yt.watchDocs()
+
 	yt.bulkUpdate(10000, msSleep)
 }
 
@@ -253,9 +260,6 @@ func (yt *YorkieTest) createAndAttachDoc(docId string) (*document.Document, erro
 func main() {
 	fmt.Printf("So it begins...\n")
 
-	//doSync := flag.Bool("sync", false, "do sync instead of update")
-	//listenOnly := flag.Bool("listen", false, "only listen for changes")
-	//text := flag.String("text", "default message", "text")
 	msSleep := flag.Int("sleep", 100, "ms sleep between updates")
 	doBulkUpdate := flag.Bool("dobulk", false, "do bulk update")
 	createProject := flag.Bool("createproject", false, "create project")
@@ -265,7 +269,7 @@ func main() {
 	value := flag.String("value", "", "value")
 	docName := flag.String("doc", "", "doc key")
 	maxDocs := flag.Int("maxdocs", 20, "max docs to generate when doing bulk updates")
-	readDoc := flag.Bool("read", false, "read doc")
+	//readDoc := flag.Bool("read", false, "read doc")
 	listDoc := flag.Bool("list", false, "list docs for project")
 	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
 	clientPort := flag.String("port", "8080", "client connection port")
@@ -274,7 +278,7 @@ func main() {
 
 	yt := NewYorkieTest(*ip, *clientPort, *projectApiKey, *maxDocs)
 
-	//yt.adminLogin()
+	yt.adminLogin()
 	yt.connectClient()
 
 	// create project and bail
@@ -305,26 +309,6 @@ func main() {
 		return
 	}
 
-	/*
-		// if random specified and NOT docname
-		if *docRandom && *docName == "" {
-			for i := 0; i < *maxDocs; i++ {
-				dn := fmt.Sprintf("doc%d", i)
-				doc := document.New(key.Key(dn))
-				if err = cli.Attach(ctx, doc); err != nil {
-					fmt.Printf("new doc error %v\n", err)
-					return
-				}
-				allDocs[dn] = doc
-			}
-		} */
-
-	if *readDoc {
-		//yt.watchDoc(allDocs)
-		//fmt.Printf(doc.Marshal())
-		return
-	}
-
 	if *doBulkUpdate {
 		yt.doBulk(*msSleep)
 	} else {
@@ -337,12 +321,12 @@ func main() {
 
 }
 
-func merge(cs ...<-chan int) <-chan int {
-	out := make(chan int)
+func mergeChannelWatch(cs ...<-chan client.WatchResponse) <-chan client.WatchResponse {
+	out := make(chan client.WatchResponse)
 	var wg sync.WaitGroup
 	wg.Add(len(cs))
 	for _, c := range cs {
-		go func(c <-chan int) {
+		go func(c <-chan client.WatchResponse) {
 			for v := range c {
 				out <- v
 			}
