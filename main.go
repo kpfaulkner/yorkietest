@@ -15,6 +15,7 @@ import (
 	"github.com/yorkie-team/yorkie/pkg/document/key"
 )
 
+// YorkieTest used to test out the Yorkie server. Can write/read documents, subscribe to changes, do bulk updates etc.
 type YorkieTest struct {
 
 	// max number of docs we're dealing with.
@@ -31,6 +32,8 @@ type YorkieTest struct {
 
 	ctx context.Context
 
+	// ugly lock used when calling Sync against Yorkie. Will look at a nicer option later, but for now
+	// working well.
 	docLock sync.Mutex
 
 	// yorkie ip
@@ -51,10 +54,10 @@ func NewYorkieTest(ip string, clientPort string, projectPublicKey string, maxDoc
 	yt.maxDocs = maxDocs
 
 	yt.allDocs = make(map[string]*document.Document)
-	// create clients.
 	return &yt
 }
 
+// watchDocs will subscribe to changes to all docs contained in the allDocs map.
 func (yt *YorkieTest) watchDocs() {
 
 	var allChannels []<-chan client.WatchResponse
@@ -68,7 +71,6 @@ func (yt *YorkieTest) watchDocs() {
 	}
 
 	docUpdateChannel := mergeChannelWatch(allChannels...)
-
 	count := 0
 	oldCount := 0
 	ticker := time.NewTicker(1 * time.Second)
@@ -85,47 +87,42 @@ func (yt *YorkieTest) watchDocs() {
 		}
 	}()
 
-	fmt.Printf("XXXX waiting for changes\n")
 	for up := range docUpdateChannel {
 
-		//fmt.Printf("update from watch %+v\n", up)
 		yt.docLock.Lock()
 		err := yt.cli.Sync(yt.ctx, up.Keys...)
 		fmt.Printf("sync.. type %v :  keys %+v\n", up.Type, up.Keys)
-		//fmt.Printf("after sync %+v\n", up)
 		if err != nil {
 			fmt.Printf("sync error %v", err)
 			yt.docLock.Unlock()
 			return
 		}
 		yt.docLock.Unlock()
-		//fmt.Printf("doc is now %+v\n", doc.Marshal())
 		count++
 		if count%100 == 0 {
 			fmt.Printf("doc %d\n", count)
 		}
 	}
-
 	done <- true
-
-	fmt.Printf("left watch\n")
 }
 
 // bulkUpdate sends a bunch of updates to all the documents (randomly)
+// sleeps sleepMS milliseconds between each update.
 func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
 
 	for i := 0; i < maxUpdates; i++ {
 
+		// maximum dealing with 100 docs...  will make configurable later. TODO(kpfaulkner)
 		k := i % 100
 		v := rand.Intn(1000)
 
-		// 20 keys... 1000 possible values.
 		key := fmt.Sprintf("k%d", k)
 		value := fmt.Sprintf("v%d", v)
 
 		// pick a random doc.
 		docName := fmt.Sprintf("doc%d", rand.Intn(yt.maxDocs))
 		doc := yt.allDocs[docName]
+
 		fmt.Printf("updating doc %s : key %s to %s\n", docName, key, value)
 		yt.updateDoc(doc, key, value)
 		if i%100 == 0 {
@@ -135,6 +132,7 @@ func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
 	}
 }
 
+// updateDoc updates a single doc with a single key/value pair.
 func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string) error {
 
 	yt.docLock.Lock()
@@ -147,7 +145,6 @@ func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string
 		} else {
 			root.SetString(key, value)
 		}
-		//fmt.Printf("MARSHAL %v\n", root.Marshal())
 
 		return nil
 	}, "updates doc "+doc.Key())
@@ -164,9 +161,10 @@ func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string
 	}
 
 	return nil
-
 }
 
+// doBulk performs bulk update against all the docs.
+// Creates the docs first (0-> maxDocs) then starts the watching and updating process.
 func (yt *YorkieTest) doBulk(msSleep int) {
 
 	// create docs.
@@ -181,9 +179,11 @@ func (yt *YorkieTest) doBulk(msSleep int) {
 	// watch all docs for updates.
 	go yt.watchDocs()
 
+	// Just do 10000 updates for now. Will make configurable TODO(kpfaulkner)
 	yt.bulkUpdate(10000, msSleep)
 }
 
+// adminLogin creates an admin client. Used for making projects.
 func (yt *YorkieTest) adminLogin() error {
 
 	addr := fmt.Sprintf("%s:11103", yt.ip)
@@ -220,16 +220,33 @@ func (yt *YorkieTest) connectClient() error {
 	return nil
 }
 
+// createProject will create a project of a given name.
 func (yt *YorkieTest) createProject(projectName string) error {
 	project, err := yt.aCli.CreateProject(yt.ctx, projectName)
 	if err != nil {
 		fmt.Printf("create project err %s\n", err.Error())
 		return err
 	}
+
 	fmt.Printf("created project %+v\n", *project)
 	return nil
 }
 
+// createProject will create a project of a given name.
+func (yt *YorkieTest) listProjects() error {
+	projects, err := yt.aCli.ListProjects(yt.ctx)
+	if err != nil {
+		fmt.Printf("list projects err %s\n", err.Error())
+		return err
+	}
+
+	for _, p := range projects {
+		fmt.Printf("Project Name %s : Public key %s\n", p.Name, p.PublicKey)
+	}
+	return nil
+}
+
+// listDocumentsForProject list document keys for a given project.
 func (yt *YorkieTest) listDocumentsForProject(projectName string) error {
 	docs, err := yt.aCli.ListDocuments(yt.ctx, projectName)
 
@@ -245,6 +262,7 @@ func (yt *YorkieTest) listDocumentsForProject(projectName string) error {
 	return nil
 }
 
+// createAndAttachDoc creates a document and attaches it to the client. Also adds to the allDocs map.
 func (yt *YorkieTest) createAndAttachDoc(docId string) (*document.Document, error) {
 
 	doc := document.New(key.Key(docId))
@@ -271,6 +289,7 @@ func main() {
 	maxDocs := flag.Int("maxdocs", 20, "max docs to generate when doing bulk updates")
 	//readDoc := flag.Bool("read", false, "read doc")
 	listDoc := flag.Bool("list", false, "list docs for project")
+	listProjects := flag.Bool("listprojects", false, "list projects")
 	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
 	clientPort := flag.String("port", "8080", "client connection port")
 
@@ -286,6 +305,15 @@ func main() {
 		err := yt.createProject(*projectName)
 		if err != nil {
 			fmt.Printf("create project error %s\n", err.Error())
+		}
+		return
+	}
+
+	// list projects
+	if *listProjects {
+		err := yt.listProjects()
+		if err != nil {
+			fmt.Printf("list project error %s\n", err.Error())
 		}
 		return
 	}
@@ -321,21 +349,22 @@ func main() {
 
 }
 
+// mergeChannelWatch just allows to watch all channels at once for document updates.
 func mergeChannelWatch(cs ...<-chan client.WatchResponse) <-chan client.WatchResponse {
-	out := make(chan client.WatchResponse)
+	overallCh := make(chan client.WatchResponse)
 	var wg sync.WaitGroup
 	wg.Add(len(cs))
-	for _, c := range cs {
-		go func(c <-chan client.WatchResponse) {
-			for v := range c {
-				out <- v
+	for _, ch := range cs {
+		go func(ch <-chan client.WatchResponse) {
+			for v := range ch {
+				overallCh <- v
 			}
 			wg.Done()
-		}(c)
+		}(ch)
 	}
 	go func() {
 		wg.Wait()
-		close(out)
+		close(overallCh)
 	}()
-	return out
+	return overallCh
 }
