@@ -11,8 +11,25 @@ import (
 	"github.com/yorkie-team/yorkie/admin"
 	"github.com/yorkie-team/yorkie/client"
 	"github.com/yorkie-team/yorkie/pkg/document"
+	"github.com/yorkie-team/yorkie/pkg/document/crdt"
 	"github.com/yorkie-team/yorkie/pkg/document/json"
 	"github.com/yorkie-team/yorkie/pkg/document/key"
+)
+
+const (
+
+	// just some test JSON data.
+	valueTemplate = `{
+      id: "test-id-%d",
+      visibility: true,
+      more: {
+        type: "testingstuff",
+        details: {
+          type: "xxxx",
+          values: [%d, %d],
+        },
+      },
+    }`
 )
 
 // YorkieTest used to test out the Yorkie server. Can write/read documents, subscribe to changes, do bulk updates etc.
@@ -62,7 +79,9 @@ func (yt *YorkieTest) watchDocs() {
 
 	var allChannels []<-chan client.WatchResponse
 	for _, doc := range yt.allDocs {
+		yt.docLock.Lock()
 		watchCh, err := yt.cli.Watch(yt.ctx, doc)
+		yt.docLock.Unlock()
 		if err != nil {
 			fmt.Printf("watch error %v", err)
 			panic("BOOM")
@@ -110,6 +129,7 @@ func (yt *YorkieTest) watchDocs() {
 // sleeps sleepMS milliseconds between each update.
 func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
 
+	t := time.Now()
 	for i := 0; i < maxUpdates; i++ {
 
 		// maximum dealing with 100 docs...  will make configurable later. TODO(kpfaulkner)
@@ -117,23 +137,30 @@ func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
 		v := rand.Intn(1000)
 
 		key := fmt.Sprintf("k%d", k)
-		value := fmt.Sprintf("v%d", v)
+		value := fmt.Sprintf(valueTemplate, v, rand.Intn(200), rand.Intn(200))
 
 		// pick a random doc.
 		docName := fmt.Sprintf("doc%d", rand.Intn(yt.maxDocs))
 		doc := yt.allDocs[docName]
 
-		fmt.Printf("updating doc %s : key %s to %s\n", docName, key, value)
-		yt.updateDoc(doc, key, value)
+		//fmt.Printf("updating doc %s : key %s to %s\n", docName, key, value)
+		err := yt.updateDoc(doc, key, value, rand.Intn(20))
+		if err != nil {
+			fmt.Printf("bulkUpdate updateDoc err %s\n", err.Error())
+
+		}
+
 		if i%100 == 0 {
 			fmt.Printf("update %d\n", i)
 		}
 		time.Sleep(time.Duration(sleepMS) * time.Millisecond)
+		fmt.Printf("Took %d ms\n", time.Since(t).Milliseconds())
+		t = time.Now()
 	}
 }
 
-// updateDoc updates a single doc with a single key/value pair.
-func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string) error {
+// updatePositioning
+func (yt *YorkieTest) updatePositioning(doc *document.Document, key string, value string) error {
 
 	yt.docLock.Lock()
 	defer yt.docLock.Unlock()
@@ -144,6 +171,60 @@ func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string
 			root.Delete(key)
 		} else {
 			root.SetString(key, value)
+
+			var ar *json.Array
+			if !root.Has("mapEntities") {
+				ar = root.SetNewArray(key)
+			} else {
+				ar = root.GetArray(key)
+			}
+			ar.AddString()
+
+		}
+
+		return nil
+	}, "updates doc "+doc.Key())
+
+	if err != nil {
+		fmt.Printf("update doc error %v", err)
+		return err
+	}
+
+	err = yt.cli.Sync(yt.ctx, doc.Key())
+	if err != nil {
+		fmt.Printf("sync error %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// updateDoc updates a single doc with a single key/value pair.
+func (yt *YorkieTest) updateDoc(doc *document.Document, key string, value string, pos int) error {
+
+	yt.docLock.Lock()
+	defer yt.docLock.Unlock()
+
+	err := doc.Update(func(root *json.Object) error {
+		// value is empty so remove key.
+		if value == "" {
+			root.Delete(key)
+		} else {
+
+			var obj *json.Object
+			if root.Has(key) {
+				//fmt.Printf("get obj\n")
+				obj = root.GetObject(key)
+			} else {
+				fmt.Printf("set obj\n")
+				obj = root.SetNewObject(key)
+			}
+
+			// value of json for particular features/drawing.
+			obj.SetString("value", value)
+
+			// put position.
+			obj.SetInteger("pos", pos)
 		}
 
 		return nil
@@ -204,7 +285,8 @@ func (yt *YorkieTest) adminLogin() error {
 
 // connectClient login and activate client
 func (yt *YorkieTest) connectClient() error {
-	cli, err := client.Dial(yt.ip+":"+yt.clientPort, client.WithAPIKey(yt.projectPublicKey))
+
+	cli, err := client.Dial(yt.ip+":"+yt.clientPort, client.WithAPIKey(yt.projectPublicKey), client.WithMaxRecvMsgSize(5000000))
 	if err != nil {
 		fmt.Printf("dial error %v", err)
 		return err
@@ -234,6 +316,13 @@ func (yt *YorkieTest) createProject(projectName string) error {
 
 // createProject will create a project of a given name.
 func (yt *YorkieTest) listProjects() error {
+
+	_, err := yt.aCli.GetProject(yt.ctx, "kdkdkd")
+	if err != nil {
+		fmt.Printf("list projects err %s\n", err.Error())
+		return err
+	}
+
 	projects, err := yt.aCli.ListProjects(yt.ctx)
 	if err != nil {
 		fmt.Printf("list projects err %s\n", err.Error())
@@ -287,13 +376,19 @@ func main() {
 	value := flag.String("value", "", "value")
 	docName := flag.String("doc", "", "doc key")
 	maxDocs := flag.Int("maxdocs", 20, "max docs to generate when doing bulk updates")
-	//readDoc := flag.Bool("read", false, "read doc")
+	watchDoc := flag.Bool("watch", false, "watch doc")
+	readDoc := flag.Bool("read", false, "read doc")
 	listDoc := flag.Bool("list", false, "list docs for project")
 	listProjects := flag.Bool("listprojects", false, "list projects")
 	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
 	clientPort := flag.String("port", "8080", "client connection port")
 
 	flag.Parse()
+
+	start := time.Now()
+	defer func() {
+		fmt.Printf("total time %d seconds\n", int(time.Since(start).Seconds()))
+	}()
 
 	yt := NewYorkieTest(*ip, *clientPort, *projectApiKey, *maxDocs)
 
@@ -318,6 +413,66 @@ func main() {
 		return
 	}
 
+	// just read a doc.
+	if *watchDoc {
+		doc, err := yt.createAndAttachDoc(*docName)
+		if err != nil {
+			fmt.Printf("create doc error %s\n", err.Error())
+			return
+		}
+
+		yt.docLock.Lock()
+		watchCh, err := yt.cli.Watch(yt.ctx, doc)
+		yt.docLock.Unlock()
+		if err != nil {
+			fmt.Printf("watch error %v", err)
+			panic("BOOM")
+		}
+		for change := range watchCh {
+			fmt.Printf("change %+v\n", change)
+			yt.cli.Sync(yt.ctx, doc.Key())
+			fmt.Printf("doc %+v\n", doc.Marshal())
+
+		}
+	}
+
+	if *readDoc {
+		doc, err := yt.createAndAttachDoc(*docName)
+		if err != nil {
+			fmt.Printf("create doc error %s\n", err.Error())
+			return
+		}
+
+		yt.docLock.Lock()
+		err = yt.cli.Sync(yt.ctx, doc.Key())
+		yt.docLock.Unlock()
+
+		if err != nil {
+			fmt.Printf("unable to read doc : %v", err)
+			panic("BOOM")
+		}
+
+		fmt.Printf("doc %s\n", doc.Marshal())
+		a := doc.Root().Has("entityHierarchy")
+		fmt.Printf("has %s\n", a)
+		eh := doc.Root().Get("entityHierarchy")
+		//eh := doc.Root().GetObject("entityHierarchy")
+		fmt.Printf("EH %s\n", eh.Marshal())
+		ar := eh.(*crdt.Array)
+
+		for _, arr := range ar.Elements() {
+			fmt.Printf("ARR %s\n", arr.Marshal())
+		}
+
+		me := doc.Root().GetObject("mapEntities")
+		fmt.Printf("ME %s\n", me.Marshal())
+		f1 := me.Get("f32c369b-4c72-49c0-b0e7-740a0ae3cfbe")
+		fmt.Printf("f1 %s\n", f1.Marshal())
+
+		return
+
+	}
+
 	if *listDoc {
 		err := yt.listDocumentsForProject(*projectName)
 		if err != nil {
@@ -333,25 +488,57 @@ func main() {
 		doc, err = yt.createAndAttachDoc(*docName)
 		if err != nil {
 			fmt.Printf("createAndAttachDoc err %s\n", err.Error())
+			return
 		}
-		return
 	}
 
 	if *doBulkUpdate {
 		yt.doBulk(*msSleep)
 	} else {
-		yt.updateDoc(doc, *keyName, *value)
-		err = yt.cli.Detach(yt.ctx, doc)
-		if err != nil {
-			fmt.Printf("unable to detach : %s\n", err.Error())
+
+		// if we have key/value... then do that.
+		// otherwise loop and make up a heap of random content.
+		if *keyName != "" && *value != "" {
+			yt.updateDoc(doc, *keyName, *value, 1)
+			err = yt.cli.Detach(yt.ctx, doc)
+			if err != nil {
+				fmt.Printf("unable to detach : %s\n", err.Error())
+			}
+			return
 		}
+
+		for i := 0; i < 10000; i++ {
+			k := fmt.Sprintf("key%d", rand.Intn(100))
+			v := fmt.Sprintf(valueTemplate, i, rand.Intn(200), rand.Intn(200))
+			//t := time.Now()
+			err = yt.updateDoc(doc, k, v, 1)
+			if err != nil {
+				fmt.Printf("unable to update doc : %s\n", err.Error())
+			}
+
+			if i%100 == 0 {
+				fmt.Printf("update %d\n", i)
+			}
+
+			// sync it
+			err = yt.cli.Sync(yt.ctx, doc.Key())
+			if err != nil {
+				fmt.Printf("sync error %v", err)
+				//return
+			}
+
+			//fmt.Printf("took %d ms\n", time.Since(t).Milliseconds())
+			time.Sleep(time.Duration(*msSleep) * time.Millisecond)
+		}
+
+		return
 	}
 
 }
 
 // mergeChannelWatch just allows to watch all channels at once for document updates.
 func mergeChannelWatch(cs ...<-chan client.WatchResponse) <-chan client.WatchResponse {
-	overallCh := make(chan client.WatchResponse)
+	overallCh := make(chan client.WatchResponse, 100000)
 	var wg sync.WaitGroup
 	wg.Add(len(cs))
 	for _, ch := range cs {
