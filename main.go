@@ -425,110 +425,6 @@ func (yt *YorkieTest) readDoc(doc *document.Document) error {
 	return nil
 }
 
-func main() {
-	fmt.Printf("So it begins...\n")
-
-	//defer profile.Start(profile.CPUProfile, profile.ProfilePath(".")).Stop()
-	//defer profile.Start(profile.MemProfile, profile.MemProfileRate(1), profile.ProfilePath(".")).Stop()
-
-	msSleep := flag.Int("sleep", 100, "ms sleep between updates per client connection")
-	projectName := flag.String("project", "", "project name")
-	commandToRun := flag.String("cmd", "", "command to run. options are: dobulk, createproject, listprojects, import, listdocs, watch, read, updatedoc")
-	projectApiKey := flag.String("projectapi", "", "project apikey")
-	keyName := flag.String("key", "", "key")
-	value := flag.String("value", "", "value")
-	docName := flag.String("doc", "", "doc key")
-	importFile := flag.String("import", "", "file to import document from")
-	certFile := flag.String("cert", "", "file path to cert")
-	noDocs := flag.Int("nodocs", 20, "number of docs to generate when doing bulk updates.")
-	noUpdates := flag.Int("noupdates", 1000, "number of updates per document")
-	concurrent := flag.Int("concurrent", 1, "number of concurrent clients to use per document")
-	createProjectPerDoc := flag.Bool("projectperdoc", false, "create project per doc for bulk test")
-	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
-	clientPort := flag.String("port", "8080", "client connection port")
-
-	flag.Parse()
-
-	start := time.Now()
-	defer func() {
-		fmt.Printf("total time %d seconds\n", int(time.Since(start).Seconds()))
-	}()
-
-	yt := NewYorkieTest(*ip, *clientPort, *projectApiKey, *noDocs, *certFile)
-
-	yt.adminLogin()
-
-	// if we have a project, then connect
-	if *projectApiKey != "" {
-		yt.connectClient(*certFile)
-	}
-
-	var doc *document.Document
-	var err error
-	// if specify doc name... just do the one.
-	if *docName != "" {
-		doc, err = yt.createAndAttachDoc(*docName)
-		if err != nil {
-			fmt.Printf("createAndAttachDoc err %s\n", err.Error())
-			return
-		}
-	}
-
-	// need to add parameter validation. TODO(kpfaulkner)
-	switch *commandToRun {
-	case "dobulk":
-		yt.doBulk(*msSleep, *concurrent, *noDocs, *noUpdates, *createProjectPerDoc)
-		return
-	case "createproject":
-		err := yt.createProject(*projectName)
-		if err != nil {
-			fmt.Printf("create project error %s\n", err.Error())
-		}
-		return
-	case "listprojects":
-		err := yt.listProjects()
-		if err != nil {
-			fmt.Printf("list project error %s\n", err.Error())
-		}
-		return
-	case "import":
-		err := yt.importFile(*importFile, doc)
-		if err != nil {
-			log.Printf("importFile err %s", err.Error())
-		}
-		return
-	case "listdocs":
-		err := yt.listDocumentsForProject(*projectName)
-		if err != nil {
-			fmt.Printf("admin err %s\n", err.Error())
-		}
-		return
-	case "watch":
-		yt.watchDocs(*noDocs, *projectApiKey, *certFile, *createProjectPerDoc)
-		return
-	case "read":
-		err := yt.readDoc(doc)
-		if err != nil {
-			log.Printf("read doc error %s", err.Error())
-		}
-		return
-	case "updatedoc":
-		if *keyName != "" && *value != "" {
-			yt.updateDoc(doc, *keyName, *value, 1)
-			err = yt.cli.Detach(yt.ctx, doc)
-			if err != nil {
-				fmt.Printf("unable to detach : %s\n", err.Error())
-			}
-			return
-		} else {
-			fmt.Printf("unable to update. Either key or value are blank\n")
-			return
-		}
-	default:
-		fmt.Printf("unknown command %s\n", *commandToRun)
-	}
-}
-
 func makeYorkieDoc(data []byte, root *json.Object) error {
 
 	var stuff map[string]interface{}
@@ -748,4 +644,108 @@ func updateDoc(ctx context.Context, cli *client.Client, doc *document.Document, 
 
 func generateBulkName(i int) string {
 	return fmt.Sprintf("bulkdoc%d", i)
+}
+
+func main() {
+	fmt.Printf("So it begins...\n")
+
+	//defer profile.Start(profile.CPUProfile, profile.ProfilePath(".")).Stop()
+	//defer profile.Start(profile.MemProfile, profile.MemProfileRate(1), profile.ProfilePath(".")).Stop()
+
+	msSleep := flag.Int("sleep", 100, "ms sleep between updates per client connection")
+	projectName := flag.String("project", "", "project name")
+	commandToRun := flag.String("cmd", "", "command to run. options are: dobulk, createproject, listprojects, import, listdocs, watch, read, updatedoc")
+	projectApiKey := flag.String("projectapi", "", "project apikey")
+	keyName := flag.String("key", "", "key")
+	value := flag.String("value", "", "value")
+	docName := flag.String("doc", "", "doc key")
+	importFile := flag.String("import", "", "file to import document from")
+	certFile := flag.String("cert", "", "file path to cert")
+	noDocs := flag.Int("nodocs", 20, "number of docs to generate when doing bulk updates.")
+	noUpdates := flag.Int("noupdates", 1000, "number of updates per document")
+	concurrent := flag.Int("concurrent", 1, "number of concurrent clients to use per document")
+	createProjectPerDoc := flag.Bool("projectperdoc", false, "create project per doc for bulk test")
+	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
+	clientPort := flag.String("port", "8080", "client connection port")
+
+	flag.Parse()
+
+	start := time.Now()
+	defer func() {
+		fmt.Printf("total time %d seconds\n", int(time.Since(start).Seconds()))
+	}()
+
+	yt := NewYorkieTest(*ip, *clientPort, *projectApiKey, *noDocs, *certFile)
+
+	yt.adminLogin()
+
+	// if we have a project, then connect
+	if *projectApiKey != "" {
+		yt.connectClient(*certFile)
+	}
+
+	var doc *document.Document
+	var err error
+	// if specify doc name... just do the one.
+	if *docName != "" {
+		doc, err = yt.createAndAttachDoc(*docName)
+		if err != nil {
+			fmt.Printf("createAndAttachDoc err %s\n", err.Error())
+			return
+		}
+	}
+
+	// need to add parameter validation. TODO(kpfaulkner)
+	switch *commandToRun {
+	case "dobulk":
+		yt.doBulk(*msSleep, *concurrent, *noDocs, *noUpdates, *createProjectPerDoc)
+		return
+	case "createproject":
+		err := yt.createProject(*projectName)
+		if err != nil {
+			fmt.Printf("create project error %s\n", err.Error())
+		}
+		return
+	case "listprojects":
+		err := yt.listProjects()
+		if err != nil {
+			fmt.Printf("list project error %s\n", err.Error())
+		}
+		return
+	case "import":
+		err := yt.importFile(*importFile, doc)
+		if err != nil {
+			log.Printf("importFile err %s", err.Error())
+		}
+		return
+	case "listdocs":
+		err := yt.listDocumentsForProject(*projectName)
+		if err != nil {
+			fmt.Printf("admin err %s\n", err.Error())
+		}
+		return
+	case "watch":
+		yt.watchDocs(*noDocs, *projectApiKey, *certFile, *createProjectPerDoc)
+		return
+	case "read":
+		err := yt.readDoc(doc)
+		if err != nil {
+			log.Printf("read doc error %s", err.Error())
+		}
+		return
+	case "updatedoc":
+		if *keyName != "" && *value != "" {
+			yt.updateDoc(doc, *keyName, *value, 1)
+			err = yt.cli.Detach(yt.ctx, doc)
+			if err != nil {
+				fmt.Printf("unable to detach : %s\n", err.Error())
+			}
+			return
+		} else {
+			fmt.Printf("unable to update. Either key or value are blank\n")
+			return
+		}
+	default:
+		fmt.Printf("unknown command %s\n", *commandToRun)
+	}
 }
