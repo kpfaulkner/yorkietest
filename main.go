@@ -527,17 +527,6 @@ func main() {
 	default:
 		fmt.Printf("unknown command %s\n", *commandToRun)
 	}
-
-	/*
-		if *doBulkUpdate {
-			yt.doBulk(*msSleep)
-		} else {
-
-			doConcurrentUpdates(*concurrent, fmt.Sprintf("%s:%s", yt.ip, yt.clientPort), *projectApiKey, *certFile, *docName, 100000, *msSleep)
-
-			return
-		} */
-
 }
 
 func makeYorkieDoc(data []byte, root *json.Object) error {
