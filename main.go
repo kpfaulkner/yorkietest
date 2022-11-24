@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,12 +89,18 @@ func NewYorkieTest(ip string, clientPort string, projectPublicKey string, maxDoc
 }
 
 // watchDocs will subscribe to changes to all docs contained in the allDocs map.
-func (yt *YorkieTest) watchDocs(noDocs int, projectPublicKey string, certFile string, createProjectPerDoc bool) error {
+func (yt *YorkieTest) watchDocs(noDocs int, projectPublicKey string, certFile string, createProjectPerDoc bool, syncDocs bool) error {
 
 	ctx := context.Background()
 	addr := fmt.Sprintf("%s:%s", yt.ip, yt.clientPort)
 
 	var allChannels []<-chan client.WatchResponse
+	type docAndClient struct {
+		doc *document.Document
+		cli *client.Client
+	}
+
+	docs := make(map[string]docAndClient)
 
 	// create a client per doc...  watching for updates.
 	for i := 0; i < noDocs; i++ {
@@ -123,7 +130,7 @@ func (yt *YorkieTest) watchDocs(noDocs int, projectPublicKey string, certFile st
 			log.Printf("cannot create doc: %s", err.Error())
 			return err
 		}
-
+		docs[docName] = docAndClient{doc: doc, cli: cli}
 		watchCh, err := cli.Watch(ctx, doc)
 		if err != nil {
 			fmt.Printf("watch error %v", err)
@@ -150,48 +157,33 @@ func (yt *YorkieTest) watchDocs(noDocs int, projectPublicKey string, certFile st
 	}()
 
 	// purely notifying of update... but not GETTING the updated content
-	for _ = range docUpdateChannel {
-		//fmt.Printf("sync.. type %v :  keys %+v\n", up.Type, up.Keys)
-		count++
+	// slow... since we have a single goroutine handling all changes...
+	// writing isn't slow due to goroutine per client...
+	for up := range docUpdateChannel {
+		//fmt.Printf("%s : sync.. type %v :  keys %+v\n", time.Now().String(), up.Type, up.Keys)
+
+		if syncDocs {
+			// if we really want to measure the performance of the sync.
+			for _, k := range up.Keys {
+
+				docClient := docs[string(k)]
+				start := time.Now()
+				err := docClient.cli.Sync(yt.ctx, k)
+				fmt.Printf("sync took %d ms\n", time.Since(start).Milliseconds())
+				if err != nil {
+					fmt.Printf("sync error %v", err)
+					return err
+				}
+			}
+
+		}
+
+		count += len(up.Keys)
 	}
 	done <- true
 
 	fmt.Printf("watch finish\n")
 	return nil
-}
-
-// bulkUpdate sends a bunch of updates to all the documents (randomly)
-// sleeps sleepMS milliseconds between each update.
-func (yt *YorkieTest) bulkUpdate(maxUpdates int, sleepMS int) {
-
-	t := time.Now()
-	for i := 0; i < maxUpdates; i++ {
-
-		// maximum dealing with 100 docs...  will make configurable later. TODO(kpfaulkner)
-		k := i % 100
-		v := rand.Intn(1000)
-
-		key := fmt.Sprintf("k%d", k)
-		value := fmt.Sprintf(valueTemplate, v, rand.Intn(200), rand.Intn(200))
-
-		// pick a random doc.
-		docName := fmt.Sprintf("doc%d", rand.Intn(yt.maxDocs))
-		doc := yt.allDocs[docName]
-
-		//fmt.Printf("updating doc %s : key %s to %s\n", docName, key, value)
-		err := yt.updateDoc(doc, key, value, rand.Intn(20))
-		if err != nil {
-			fmt.Printf("bulkUpdate updateDoc err %s\n", err.Error())
-
-		}
-
-		if i%100 == 0 {
-			fmt.Printf("update %d\n", i)
-		}
-		time.Sleep(time.Duration(sleepMS) * time.Millisecond)
-		fmt.Printf("Took %d ms\n", time.Since(t).Milliseconds())
-		t = time.Now()
-	}
 }
 
 // updateDoc updates a single doc with a single key/value pair.
@@ -260,10 +252,9 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 	startWG := sync.WaitGroup{}
 	startWG.Add(1)
 	ctx := context.Background()
+	var counter atomic.Int32
 	for i := 0; i < noDocs; i++ {
 		docName := generateBulkName(i)
-		fmt.Printf("Starting for docid %s\n", docName)
-
 		var publicKey string
 		if createProjectPerDoc {
 			key, err := yt.createProjectReturnKey(ctx, docName)
@@ -276,7 +267,7 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 			publicKey = yt.projectPublicKey
 		}
 
-		go doConcurrentUpdates(concurrentPerDoc, addr, publicKey, yt.certFile, docName, noUpdates, msSleep, &wg, &startWG)
+		go doConcurrentUpdates(concurrentPerDoc, addr, publicKey, yt.certFile, docName, noUpdates, msSleep, &wg, &startWG, &counter)
 
 		// slow down creation...
 		time.Sleep(100 * time.Millisecond)
@@ -287,6 +278,16 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 
 	startWG.Done()
 	fmt.Printf("waiting\n")
+
+	go func() {
+		fmt.Printf("XXXXXXXXXX\n")
+		secondsPassed := 0.0
+		for {
+			time.Sleep(1 * time.Second)
+			secondsPassed++
+			fmt.Printf("counter %f per second\n", float64(counter.Load())/secondsPassed)
+		}
+	}()
 	wg.Wait()
 
 	return nil
@@ -327,13 +328,13 @@ func (yt *YorkieTest) connectClient(certFile string) error {
 
 // createProject will create a project of a given name.
 func (yt *YorkieTest) createProject(projectName string) error {
-	project, err := yt.aCli.CreateProject(yt.ctx, projectName)
+	_, err := yt.aCli.CreateProject(yt.ctx, projectName)
 	if err != nil {
-		fmt.Printf("create project err %s\n", err.Error())
+		//fmt.Printf("create project err %s\n", err.Error())
 		return err
 	}
 
-	fmt.Printf("created project %+v\n", *project)
+	//fmt.Printf("created project %+v\n", *project)
 	return nil
 }
 
@@ -551,9 +552,9 @@ func createAndAttachDoc(ctx context.Context, cli *client.Client, docId string) (
 // completely separate from rest of functions.
 // Create new documents and attach them for each goroutine.
 // Want to check what impact locks have on it.
-func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string, certFile string, docId string, noUpdates int, sleepInMs int, wg *sync.WaitGroup, startWG *sync.WaitGroup) {
+func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string, certFile string, docId string,
+	noUpdates int, sleepInMs int, wg *sync.WaitGroup, startWG *sync.WaitGroup, counter *atomic.Int32) {
 
-	fmt.Printf("XXXX project key %s\n", projectKey)
 	updateChannel := make(chan updateDetails, noUpdates)
 
 	for i := 0; i < noUpdates; i++ {
@@ -564,7 +565,7 @@ func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string
 
 	close(updateChannel)
 
-	var counter atomic.Int32
+	//var counter atomic.Int32
 	ctx := context.Background()
 	for i := 0; i < noConcurrentUpdates; i++ {
 		cli, err := connectClient(ctx, addr, projectKey, certFile)
@@ -581,15 +582,16 @@ func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string
 		cli2 := cli
 		doc2 := doc
 		wg.Add(1)
-		go func(cli *client.Client, doc *document.Document, startWG *sync.WaitGroup) {
+		go func(cli *client.Client, doc *document.Document, startWG *sync.WaitGroup, identifier int) {
 			startWG.Wait()
 			for update := range updateChannel {
 				start := time.Now()
+				//newUpdateKey := fmt.Sprintf("%s-%d", update.key, identifier)
+				newUpdateKey := update.key
+				updateDoc(ctx, cli, doc, newUpdateKey, update.value)
 				counter.Add(1)
-				updateDoc(ctx, cli, doc, update.key, update.value)
-
 				if counter.Load()%100 == 0 {
-					fmt.Printf("%s completed %d updates\n", docId, counter.Load())
+					//fmt.Printf("%s completed %d updates\n", docId, counter.Load())
 				}
 
 				totalSleep := time.Duration(sleepInMs) * time.Millisecond
@@ -601,6 +603,7 @@ func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string
 				//fmt.Printf("sleepDuration %d\n", sleepDuration.Milliseconds())
 
 				if sleepDuration > 0 {
+					//fmt.Printf("sleeping for %d ms\n", sleepDuration.Milliseconds())
 					time.Sleep(sleepDuration)
 				} else {
 					log.Printf("Took too long ( %d ms), no sleeping", timeTaken.Milliseconds())
@@ -608,7 +611,7 @@ func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string
 			}
 			wg.Done()
 			fmt.Printf("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX done\n")
-		}(cli2, doc2, startWG)
+		}(cli2, doc2, startWG, i)
 	}
 }
 
@@ -630,14 +633,14 @@ func updateDoc(ctx context.Context, cli *client.Client, doc *document.Document, 
 		return err
 	}
 
-	s := time.Now()
+	//s := time.Now()
 	err = cli.Sync(ctx, doc.Key())
 	if err != nil {
 		fmt.Printf("sync error %v", err)
 		return err
 	}
 
-	fmt.Printf("sync took %d ms\n", time.Since(s).Milliseconds())
+	//fmt.Printf("sync took %d ms\n", time.Since(s).Milliseconds())
 
 	return nil
 }
@@ -646,8 +649,20 @@ func generateBulkName(i int) string {
 	return fmt.Sprintf("bulkdoc%d", i)
 }
 
+// catchInterrupt will catch ctrl+c and exit the program with an appropriate
+// report based on the command given. TODO(kpfaulkner) implement me!!
+func catchInterrupt() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	<-c
+	fmt.Printf("interrupt..........\n")
+	os.Exit(1)
+}
+
 func main() {
 	fmt.Printf("So it begins...\n")
+
+	go catchInterrupt()
 
 	//defer profile.Start(profile.CPUProfile, profile.ProfilePath(".")).Stop()
 	//defer profile.Start(profile.MemProfile, profile.MemProfileRate(1), profile.ProfilePath(".")).Stop()
@@ -665,6 +680,7 @@ func main() {
 	noUpdates := flag.Int("noupdates", 1000, "number of updates per document")
 	concurrent := flag.Int("concurrent", 1, "number of concurrent clients to use per document")
 	createProjectPerDoc := flag.Bool("projectperdoc", false, "create project per doc for bulk test")
+	syncDocs := flag.Bool("syncdocs", false, "when watching docs, sync doc and not just be notified of changes")
 	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
 	clientPort := flag.String("port", "8080", "client connection port")
 
@@ -725,7 +741,7 @@ func main() {
 		}
 		return
 	case "watch":
-		yt.watchDocs(*noDocs, *projectApiKey, *certFile, *createProjectPerDoc)
+		yt.watchDocs(*noDocs, *projectApiKey, *certFile, *createProjectPerDoc, *syncDocs)
 		return
 	case "read":
 		err := yt.readDoc(doc)
