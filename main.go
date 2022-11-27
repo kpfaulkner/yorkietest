@@ -299,19 +299,23 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 	// stats gathering goroutine
 	go func(ctx context.Context) {
 		startTime := time.Now()
+		averagePerSecond := 0.0
 		for {
 			select {
 			case <-time.After(1 * time.Second):
 				elapsedSinceStart := time.Now().Sub(startTime)
-				perSecond := float64(counter.Load()) / elapsedSinceStart.Seconds()
-				fmt.Printf("average %f per second\n", perSecond)
+				averagePerSecond = float64(counter.Load()) / elapsedSinceStart.Seconds()
+
 			case <-ctx.Done():
+				fmt.Printf("average updates %f per second\n", averagePerSecond)
 				return
 			}
 		}
+
 	}(ctx)
 
 	stopCh := make(chan struct{})
+	stopMetricsCh := make(chan struct{})
 	displayStatsWG := sync.WaitGroup{}
 	displayStatsWG.Add(1)
 	go func(statsCh chan updateStats, stopCh chan struct{}, displayStatsWG *sync.WaitGroup) {
@@ -366,16 +370,12 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 	if gatherMetrics {
 		go func(stopCh chan struct{}) {
 			addr := fmt.Sprintf("%s:%s", yt.ip, "11102")
-			startMetrics, err := getMetrics(addr)
+			_, err := getMetrics(addr)
 			if err != nil {
 				log.Printf("unable to get metrics : %s", err.Error())
 				// just return early... let testing proceed without metrics
 				// Could be blocked port etc.
 				return
-			}
-
-			for k, _ := range startMetrics {
-				fmt.Printf("start stats key %s\n", k)
 			}
 
 			done := false
@@ -393,23 +393,46 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 						// Could be blocked port etc.
 					}
 
-					memoryTotal := metrics["go_memstats_alloc_bytes"].GetMetric()[0].GetGauge().GetValue()
-					fmt.Printf("go_memstats_alloc_bytes stats 	%0.5f\n", memoryTotal)
+					/*
+						memoryTotal := metrics["go_memstats_alloc_bytes"].GetMetric()[0].GetGauge().GetValue()
+						fmt.Printf("go_memstats_alloc_bytes stats 	%0.5f\n", memoryTotal)
 
-					memoryTotal = metrics["go_memstats_heap_alloc_bytes"].GetMetric()[0].GetGauge().GetValue()
-					fmt.Printf("go_memstats_heap_alloc_bytes stats 	%0.5f\n", memoryTotal)
-
+						memoryTotal = metrics["go_memstats_heap_alloc_bytes"].GetMetric()[0].GetGauge().GetValue()
+						fmt.Printf("go_memstats_heap_alloc_bytes stats 	%0.5f\n", memoryTotal)
+					*/
 					handled := metrics["grpc_server_handled_total"]
-					fmt.Printf("%v\n", handled)
+					for _, m := range handled.Metric {
+						foundOK := false
+						value := 0.0
+						foundPushPull := false
+						for _, l := range m.GetLabel() {
+							if l.GetName() == "grpc_method" && l.GetValue() == "PushPull" {
+								foundPushPull = true
+							}
+
+							if l.GetName() == "grpc_code" && l.GetValue() == "OK" {
+								foundOK = true
+								value = m.GetCounter().GetValue()
+							}
+						}
+
+						if foundOK && foundPushPull {
+							fmt.Printf("grpc_server_handled_total %f\n", value)
+						}
+					}
+
 				}
 			}
 
-		}(stopCh)
+		}(stopMetricsCh)
 	}
 
 	wg.Wait()
 	cancel()
 	stopCh <- struct{}{}
+	if gatherMetrics {
+		stopMetricsCh <- struct{}{}
+	}
 	displayStatsWG.Wait()
 	return nil
 }
@@ -720,12 +743,11 @@ func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string
 
 				if sleepDuration > 0 {
 					time.Sleep(sleepDuration)
+					stats.sleepDurationMS = sleepDuration.Milliseconds()
+					statsCh <- *stats
 				} else {
 					log.Printf("Took too long ( %d ms), no sleeping", timeTaken.Milliseconds())
 				}
-
-				stats.sleepDurationMS = sleepDuration.Milliseconds()
-				statsCh <- *stats
 			}
 			wg.Done()
 		}(cli2, doc2, startWG, i, statsCh)
