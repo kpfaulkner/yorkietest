@@ -257,7 +257,7 @@ func (yt *YorkieTest) createProjectReturnKey(ctx context.Context, docName string
 // creates concurrentPerDoc clients per doc.
 // createProjectPerDoc indicates if each document should have it's own
 // project. Need to confirm if this impacts Yorkies performance or not.
-func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUpdates int, createProjectPerDoc bool) error {
+func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUpdates int, createProjectPerDoc bool, gatherMetrics bool) error {
 
 	statsCh := make(chan updateStats, 1000000)
 
@@ -361,6 +361,51 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 		fmt.Printf("max sync duration 	%d ms\n", maxSyncDurationMS)
 		displayStatsWG.Done()
 	}(statsCh, stopCh, &displayStatsWG)
+
+	// gather metrics from yorkie
+	if gatherMetrics {
+		go func(stopCh chan struct{}) {
+			addr := fmt.Sprintf("%s:%s", yt.ip, "11102")
+			startMetrics, err := getMetrics(addr)
+			if err != nil {
+				log.Printf("unable to get metrics : %s", err.Error())
+				// just return early... let testing proceed without metrics
+				// Could be blocked port etc.
+				return
+			}
+
+			for k, _ := range startMetrics {
+				fmt.Printf("start stats key %s\n", k)
+			}
+
+			done := false
+			for !done {
+				select {
+				case <-stopCh:
+					done = true
+				case <-time.After(5 * time.Second):
+					// get stats every 60 seconds... TODO(kpfaulkner) modify to be configurable
+					metrics, err := getMetrics(addr)
+					if err != nil {
+						log.Printf("unable to get metrics : %s", err.Error())
+
+						return // just return early... let testing proceed without metrics
+						// Could be blocked port etc.
+					}
+
+					memoryTotal := metrics["go_memstats_alloc_bytes"].GetMetric()[0].GetGauge().GetValue()
+					fmt.Printf("go_memstats_alloc_bytes stats 	%0.5f\n", memoryTotal)
+
+					memoryTotal = metrics["go_memstats_heap_alloc_bytes"].GetMetric()[0].GetGauge().GetValue()
+					fmt.Printf("go_memstats_heap_alloc_bytes stats 	%0.5f\n", memoryTotal)
+
+					handled := metrics["grpc_server_handled_total"]
+					fmt.Printf("%v\n", handled)
+				}
+			}
+
+		}(stopCh)
+	}
 
 	wg.Wait()
 	cancel()
@@ -755,6 +800,7 @@ func main() {
 	concurrent := flag.Int("concurrent", 1, "number of concurrent clients to use per document")
 	createProjectPerDoc := flag.Bool("projectperdoc", false, "create project per doc for bulk test")
 	watchIdleDocs := flag.Bool("watchidle", false, "watch for idle (non updated) docs. This means connection/attach is done but no updates are expected")
+	metrics := flag.Bool("metrics", false, "gather metrics from yorkie server")
 	syncDocs := flag.Bool("syncdocs", false, "when watching docs, sync doc and not just be notified of changes")
 	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
 	clientPort := flag.String("port", "8080", "client connection port")
@@ -789,7 +835,7 @@ func main() {
 	// need to add parameter validation. TODO(kpfaulkner)
 	switch *commandToRun {
 	case "dobulk":
-		yt.doBulk(*msSleep, *concurrent, *noDocs, *noUpdates, *createProjectPerDoc)
+		yt.doBulk(*msSleep, *concurrent, *noDocs, *noUpdates, *createProjectPerDoc, *metrics)
 		return
 	case "createproject":
 		err := yt.createProject(*projectName)
