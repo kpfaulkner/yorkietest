@@ -38,6 +38,11 @@ const (
     }`
 )
 
+type updateStats struct {
+	syncDurationMS  int64
+	sleepDurationMS int64
+}
+
 type updateDetails struct {
 	key   string
 	value string
@@ -89,7 +94,9 @@ func NewYorkieTest(ip string, clientPort string, projectPublicKey string, maxDoc
 }
 
 // watchDocs will subscribe to changes to all docs contained in the allDocs map.
-func (yt *YorkieTest) watchDocs(noDocs int, projectPublicKey string, certFile string, createProjectPerDoc bool, syncDocs bool) error {
+// watchIdleDocs is just watching for docs we KNOW we wont update. This means we're just
+// keeping the connection open.
+func (yt *YorkieTest) watchDocs(noDocs int, projectPublicKey string, certFile string, createProjectPerDoc bool, syncDocs bool, watchIdleDocs bool) error {
 
 	ctx := context.Background()
 	addr := fmt.Sprintf("%s:%s", yt.ip, yt.clientPort)
@@ -105,7 +112,12 @@ func (yt *YorkieTest) watchDocs(noDocs int, projectPublicKey string, certFile st
 	// create a client per doc...  watching for updates.
 	for i := 0; i < noDocs; i++ {
 
-		docName := generateBulkName(i)
+		var docName string
+		if watchIdleDocs {
+			docName = generateIdleName(i)
+		} else {
+			docName = generateBulkName(i)
+		}
 		fmt.Printf("connecting for doc %s\n", docName)
 
 		var pubKey string
@@ -247,11 +259,16 @@ func (yt *YorkieTest) createProjectReturnKey(ctx context.Context, docName string
 // project. Need to confirm if this impacts Yorkies performance or not.
 func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUpdates int, createProjectPerDoc bool) error {
 
+	statsCh := make(chan updateStats, 1000000)
+
 	wg := sync.WaitGroup{}
+
+	// add WG total here.
+	wg.Add(noDocs * concurrentPerDoc)
 	addr := fmt.Sprintf("%s:%s", yt.ip, yt.clientPort)
 	startWG := sync.WaitGroup{}
 	startWG.Add(1)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
 	var counter atomic.Int32
 	for i := 0; i < noDocs; i++ {
 		docName := generateBulkName(i)
@@ -267,7 +284,7 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 			publicKey = yt.projectPublicKey
 		}
 
-		go doConcurrentUpdates(concurrentPerDoc, addr, publicKey, yt.certFile, docName, noUpdates, msSleep, &wg, &startWG, &counter)
+		go doConcurrentUpdates(concurrentPerDoc, addr, publicKey, yt.certFile, docName, noUpdates, msSleep, &wg, &startWG, &counter, statsCh)
 
 		// slow down creation...
 		time.Sleep(100 * time.Millisecond)
@@ -279,17 +296,76 @@ func (yt *YorkieTest) doBulk(msSleep int, concurrentPerDoc int, noDocs int, noUp
 	startWG.Done()
 	fmt.Printf("waiting\n")
 
-	go func() {
-		fmt.Printf("XXXXXXXXXX\n")
-		secondsPassed := 0.0
+	// stats gathering goroutine
+	go func(ctx context.Context) {
+		startTime := time.Now()
 		for {
-			time.Sleep(1 * time.Second)
-			secondsPassed++
-			fmt.Printf("counter %f per second\n", float64(counter.Load())/secondsPassed)
+			select {
+			case <-time.After(1 * time.Second):
+				elapsedSinceStart := time.Now().Sub(startTime)
+				perSecond := float64(counter.Load()) / elapsedSinceStart.Seconds()
+				fmt.Printf("average %f per second\n", perSecond)
+			case <-ctx.Done():
+				return
+			}
 		}
-	}()
-	wg.Wait()
+	}(ctx)
 
+	stopCh := make(chan struct{})
+	displayStatsWG := sync.WaitGroup{}
+	displayStatsWG.Add(1)
+	go func(statsCh chan updateStats, stopCh chan struct{}, displayStatsWG *sync.WaitGroup) {
+
+		minSleepDurationMS := int64(1000000)
+		maxSleepDurationMS := int64(0)
+		minSyncDurationMS := int64(1000000)
+		maxSyncDurationMS := int64(0)
+		totalSleepDurationMS := int64(0)
+		totalSyncDurationMS := int64(0)
+		statsCount := 0
+		done := false
+		for !done {
+			select {
+			case <-stopCh:
+				done = true
+			case stats := <-statsCh:
+
+				//fmt.Printf("stats %v\n", stats)
+				totalSleepDurationMS += stats.sleepDurationMS
+				totalSyncDurationMS += stats.syncDurationMS
+				if stats.syncDurationMS < minSyncDurationMS {
+					minSyncDurationMS = stats.syncDurationMS
+				}
+
+				if stats.syncDurationMS > maxSyncDurationMS {
+					maxSyncDurationMS = stats.syncDurationMS
+				}
+
+				if stats.sleepDurationMS < minSleepDurationMS {
+					minSleepDurationMS = stats.sleepDurationMS
+				}
+
+				if stats.sleepDurationMS > maxSleepDurationMS {
+					maxSleepDurationMS = stats.sleepDurationMS
+				}
+				statsCount++
+			}
+		}
+
+		fmt.Printf("\n\n")
+		fmt.Printf("average sleep duration 	%d ms\n", totalSleepDurationMS/int64(statsCount))
+		fmt.Printf("average sync duration 	%d ms\n", totalSyncDurationMS/int64(statsCount))
+		fmt.Printf("min sleep duration 	%d ms\n", minSleepDurationMS)
+		fmt.Printf("max sleep duration	%d ms\n", maxSleepDurationMS)
+		fmt.Printf("min sync duration 	%d ms\n", minSyncDurationMS)
+		fmt.Printf("max sync duration 	%d ms\n", maxSyncDurationMS)
+		displayStatsWG.Done()
+	}(statsCh, stopCh, &displayStatsWG)
+
+	wg.Wait()
+	cancel()
+	stopCh <- struct{}{}
+	displayStatsWG.Wait()
 	return nil
 }
 
@@ -552,8 +628,9 @@ func createAndAttachDoc(ctx context.Context, cli *client.Client, docId string) (
 // completely separate from rest of functions.
 // Create new documents and attach them for each goroutine.
 // Want to check what impact locks have on it.
+// Stats returned via statsCh
 func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string, certFile string, docId string,
-	noUpdates int, sleepInMs int, wg *sync.WaitGroup, startWG *sync.WaitGroup, counter *atomic.Int32) {
+	noUpdates int, sleepInMs int, wg *sync.WaitGroup, startWG *sync.WaitGroup, counter *atomic.Int32, statsCh chan updateStats) {
 
 	updateChannel := make(chan updateDetails, noUpdates)
 
@@ -565,7 +642,6 @@ func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string
 
 	close(updateChannel)
 
-	//var counter atomic.Int32
 	ctx := context.Background()
 	for i := 0; i < noConcurrentUpdates; i++ {
 		cli, err := connectClient(ctx, addr, projectKey, certFile)
@@ -581,44 +657,39 @@ func doConcurrentUpdates(noConcurrentUpdates int, addr string, projectKey string
 		// local copy... just so loop and go routines dont screw up.
 		cli2 := cli
 		doc2 := doc
-		wg.Add(1)
-		go func(cli *client.Client, doc *document.Document, startWG *sync.WaitGroup, identifier int) {
+		go func(cli *client.Client, doc *document.Document, startWG *sync.WaitGroup, identifier int, statsCh chan updateStats) {
 			startWG.Wait()
 			for update := range updateChannel {
 				start := time.Now()
 				//newUpdateKey := fmt.Sprintf("%s-%d", update.key, identifier)
 				newUpdateKey := update.key
-				updateDoc(ctx, cli, doc, newUpdateKey, update.value)
-				counter.Add(1)
-				if counter.Load()%100 == 0 {
-					//fmt.Printf("%s completed %d updates\n", docId, counter.Load())
+				stats, err := updateDoc(ctx, cli, doc, newUpdateKey, update.value)
+				if err != nil {
+					log.Printf("unable to update doc : %v", err)
+					continue
 				}
-
+				counter.Add(1)
 				totalSleep := time.Duration(sleepInMs) * time.Millisecond
 				timeTaken := time.Since(start)
 				sleepDuration := totalSleep - timeTaken
 
-				//fmt.Printf("total sleep %d\n", totalSleep.Milliseconds())
-				//fmt.Printf("timetaken %d\n", timeTaken.Milliseconds())
-				//fmt.Printf("sleepDuration %d\n", sleepDuration.Milliseconds())
-
 				if sleepDuration > 0 {
-					//fmt.Printf("sleeping for %d ms\n", sleepDuration.Milliseconds())
 					time.Sleep(sleepDuration)
 				} else {
 					log.Printf("Took too long ( %d ms), no sleeping", timeTaken.Milliseconds())
 				}
+
+				stats.sleepDurationMS = sleepDuration.Milliseconds()
+				statsCh <- *stats
 			}
 			wg.Done()
-			fmt.Printf("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX done\n")
-		}(cli2, doc2, startWG, i)
+		}(cli2, doc2, startWG, i, statsCh)
 	}
 }
 
-func updateDoc(ctx context.Context, cli *client.Client, doc *document.Document, key string, value string) error {
+func updateDoc(ctx context.Context, cli *client.Client, doc *document.Document, key string, value string) (*updateStats, error) {
 
 	err := doc.Update(func(root *json.Object) error {
-
 		// value is empty so remove key.
 		if value == "" {
 			root.Delete(key)
@@ -630,23 +701,26 @@ func updateDoc(ctx context.Context, cli *client.Client, doc *document.Document, 
 	}, "updates doc "+doc.Key())
 	if err != nil {
 		fmt.Printf("update doc error %v", err)
-		return err
+		return nil, err
 	}
 
-	//s := time.Now()
+	syncStart := time.Now()
 	err = cli.Sync(ctx, doc.Key())
 	if err != nil {
 		fmt.Printf("sync error %v", err)
-		return err
+		return nil, err
 	}
-
-	//fmt.Printf("sync took %d ms\n", time.Since(s).Milliseconds())
-
-	return nil
+	syncEnd := time.Now()
+	stats := updateStats{syncDurationMS: syncEnd.Sub(syncStart).Milliseconds()}
+	return &stats, nil
 }
 
 func generateBulkName(i int) string {
 	return fmt.Sprintf("bulkdoc%d", i)
+}
+
+func generateIdleName(i int) string {
+	return fmt.Sprintf("idledoc%d", i)
 }
 
 // catchInterrupt will catch ctrl+c and exit the program with an appropriate
@@ -680,6 +754,7 @@ func main() {
 	noUpdates := flag.Int("noupdates", 1000, "number of updates per document")
 	concurrent := flag.Int("concurrent", 1, "number of concurrent clients to use per document")
 	createProjectPerDoc := flag.Bool("projectperdoc", false, "create project per doc for bulk test")
+	watchIdleDocs := flag.Bool("watchidle", false, "watch for idle (non updated) docs. This means connection/attach is done but no updates are expected")
 	syncDocs := flag.Bool("syncdocs", false, "when watching docs, sync doc and not just be notified of changes")
 	ip := flag.String("ip", "10.0.0.39", "yorkie ip")
 	clientPort := flag.String("port", "8080", "client connection port")
@@ -688,7 +763,7 @@ func main() {
 
 	start := time.Now()
 	defer func() {
-		fmt.Printf("total time %d seconds\n", int(time.Since(start).Seconds()))
+		fmt.Printf("\n\ntotal time %d seconds\n", int(time.Since(start).Seconds()))
 	}()
 
 	yt := NewYorkieTest(*ip, *clientPort, *projectApiKey, *noDocs, *certFile)
@@ -741,7 +816,7 @@ func main() {
 		}
 		return
 	case "watch":
-		yt.watchDocs(*noDocs, *projectApiKey, *certFile, *createProjectPerDoc, *syncDocs)
+		yt.watchDocs(*noDocs, *projectApiKey, *certFile, *createProjectPerDoc, *syncDocs, *watchIdleDocs)
 		return
 	case "read":
 		err := yt.readDoc(doc)
